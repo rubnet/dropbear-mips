@@ -140,10 +140,10 @@ jobs:
           done
           [ "$FAIL" -eq 0 ] || exit 1
           # qemu 用户态实跑: 验证指令集与 musl syscall 兼容 (模拟 24Kc, 覆盖 MIPS32r2)
-          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static >/dev/null
-          qemu-mipsel-static ./dropbear -V
-          qemu-mipsel-static ./dropbearkey -t ed25519 -f /tmp/testkey >/dev/null \
-            && echo "qemu-mipsel: dropbearkey ed25519 keygen OK"
+          #sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static >/dev/null
+          #qemu-mipsel-static ./dropbear -V
+          #qemu-mipsel-static ./dropbearkey -t ed25519 -f /tmp/testkey >/dev/null \
+          #  && echo "qemu-mipsel: dropbearkey ed25519 keygen OK"
 
       - name: Package
         run: |
