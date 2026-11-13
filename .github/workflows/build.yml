@@ -1,0 +1,186 @@
+name: Build Minimal Static Dropbear for EN751221
+
+on:
+  workflow_dispatch:
+    inputs:
+      dropbear_version:
+        description: 'Dropbear版本(留空=最新)'
+        required: false
+        default: ''
+
+env:
+  BUILD_DIR: /tmp/db-build
+  INSTALL_DIR: /tmp/db-install
+  ARTIFACT_NAME: dropbear-min-en751221
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-mips-linux-gnu libc6-dev-mips-cross wget xz-utils
+
+        mkdir -p ${{ env.BUILD_DIR }} ${{ env.INSTALL_DIR }}
+
+    - name: Get Latest Version
+      id: ver
+      run: |
+        if [ -n "${{ github.event.inputs.dropbear_version }}" ]; then
+          V="${{ github.event.inputs.dropbear_version }}"
+        else
+          V=$(curl -sL https://api.github.com/repos/mkj/dropbear/releases/latest \
+              | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        fi
+        echo "version=$V" >> $GITHUB_OUTPUT
+        echo "📦 Dropbear: $V"
+
+    - name: Download Source
+      run: |
+        cd ${{ env.BUILD_DIR }}
+        wget -q https://github.com/mkj/dropbear/archive/refs/tags/${{ steps.ver.outputs.version }}.tar.gz
+        tar -xzf ${{ steps.ver.outputs.version }}.tar.gz
+
+    - name: Configure (Minimal)
+      run: |
+        cd ${{ env.BUILD_DIR }}/dropbear-${{ steps.ver.outputs.version }}
+
+        # ===== 体积优化编译参数 =====
+        export CC=mips-linux-gnu-gcc
+        export AR=mips-linux-gnu-ar
+        export RANLIB=mips-linux-gnu-ranlib
+        export STRIP=mips-linux-gnu-strip
+
+        # -Os: 优化体积 (而非 -O2 优化速度)
+        # -ffunction-sections/-fdata-sections: 按函数/数据分段
+        # 配合 --gc-sections 链接时丢弃未使用代码
+        # -msingle-float 备选, softfloat 芯片用 -msoft-float
+        export CFLAGS="-march=mips32 -mabi=32 -msoft-float \
+                       -Os -ffunction-sections -fdata-sections \
+                       -fno-unwind-tables -fno-asynchronous-unwind-tables \
+                       -fomit-frame-pointer \
+                       -DDROPBEAR_SMALL_CODE \
+                       -DDEBUG_TRACE=0"
+
+        # --gc-sections: 链接器删除未引用段
+        # -Wl,-S: 不生成调试符号(也可后续strip)
+        export LDFLAGS="-static -Wl,--gc-sections -Wl,-S -Wl,-O1"
+
+        ./configure \
+          --host=mips-linux \
+          --prefix=${{ env.INSTALL_DIR }} \
+          --disable-zlib \
+          --disable-syslog \
+          --disable-lastlog \
+          --disable-utmp \
+          --disable-utmpx \
+          --disable-wtmp \
+          --disable-wtmpx \
+          --disable-loginfunc \
+          --disable-pututline \
+          --disable-pututxline \
+          --disable-shadow \
+          --disable-largefile \
+          --disable-openpty \
+          --disable-harden \
+          --enable-bundled-libtom \
+          --enable-static
+
+        echo "✅ 配置完成 (最小化模式)"
+
+    - name: Build (Multi-call Binary)
+      run: |
+        cd ${{ env.BUILD_DIR }}/dropbear-${{ steps.ver.outputs.version }}
+
+        # 只编译最核心的4个程序, 多合一联动构建
+        # 说明:
+        #   dropbear     - SSH服务器
+        #   dbclient     - SSH客户端
+        #   dropbearkey  - 密钥生成
+        #   scp          - 远程复制 (依赖dbclient)
+        # 不编译 dropbearconvert (密钥转换, 一般用不到)
+        make -j$(nproc) \
+          PROGRAMS="dropbear dropbearkey"
+
+        make install-program
+
+        echo "🔨 编译完成"
+
+    - name: Strip & Optimize
+      run: |
+        # strip 是减小体积最有效的一步, 通常砍掉 60-70%
+        cd ${{ env.INSTALL_DIR }}
+        find . -type f -exec mips-linux-gnu-strip \
+          --strip-all \
+          --remove-section=.comment \
+          --remove-section=.note \
+          {} \; 2>/dev/null || true
+
+        echo "📉 Strip后体积对比:"
+        for f in sbin/dropbear bin/dbclient bin/dropbearkey bin/scp; do
+          ls -lh "$f" 2>/dev/null
+        done
+
+    - name: Verify
+      run: |
+        echo "🔍 验证静态链接:"
+        file ${{ env.INSTALL_DIR }}/sbin/dropbear
+        echo ""
+        echo "📋 动态依赖 (静态编译应为空):"
+        mips-linux-gnu-readelf -d ${{ env.INSTALL_DIR }}/sbin/dropbear || echo "✅ 无动态依赖"
+        echo ""
+        echo "🔍 架构检查 (应为 MIPS, big-endian, soft-float):"
+        mips-linux-gnu-readelf -h ${{ env.INSTALL_DIR }}/sbin/dropbear | grep -E "Class|Data|Machine|Flags" || true
+
+    - name: Package
+      run: |
+        cd ${{ env.INSTALL_DIR }}
+
+        cat > README.md << 'EOF'
+        # Dropbear Minimal Static for EN751221
+
+        - 目标: EcoNet EN751221 (MIPS32 BE, softfloat), Linux 3.18.21
+        - 编译: -Os + DROPBEAR_SMALL_CODE + gc-sections + strip
+        - 已禁用: zlib/syslog/utmp/wtmp/shadow/largefile
+
+        ## 使用
+        chmod +x dropbear
+        ./dropbearkey -t rsa -s 1024 -f /etc/dropbear_rsa_host_key
+        ./dropbear -r /etc/dropbear_rsa_host_key -p 22
+        EOF
+
+        tar -czf ${{ env.ARTIFACT_NAME }}-${{ steps.ver.outputs.version }}.tar.gz \
+          README.md sbin bin
+        sha256sum ${{ env.ARTIFACT_NAME }}-${{ steps.ver.outputs.version }}.tar.gz > SHA256SUMS
+
+        echo "📦 最终产物:"
+        ls -lh *.tar.gz SHA256SUMS
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}-${{ steps.ver.outputs.version }}
+        path: |
+          ${{ env.INSTALL_DIR }}/${{ env.ARTIFACT_NAME }}-${{ steps.ver.outputs.version }}.tar.gz
+          ${{ env.INSTALL_DIR }}/SHA256SUMS
+        retention-days: 90
+
+    - name: Summary
+      run: |
+        echo "## 🎉 构建完成" >> $GITHUB_STEP_SUMMARY
+        echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| Dropbear | ${{ steps.ver.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| 架构 | MIPS32 BE / softfloat / static |" >> $GITHUB_STEP_SUMMARY
+        echo "| 优化 | -Os + SMALL_CODE + gc-sections + strip |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ls -lh ${{ env.INSTALL_DIR }}/sbin ${{ env.INSTALL_DIR }}/bin >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
