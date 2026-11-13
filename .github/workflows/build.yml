@@ -58,7 +58,7 @@ jobs:
       - name: Install musl cross toolchain (mipsel soft-float)
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o /opt/tc.tgz wget https://github.com/musl-cc/musl.cc/releases/latest/download/mipsel-linux-muslsf-cross.tgz
+          curl -fsSL --retry 3 -o /opt/tc.tgz https://github.com/musl-cc/musl.cc/releases/latest/download/mipsel-linux-muslsf-cross.tgz
           tar xzf /opt/tc.tgz -C /opt && rm /opt/tc.tgz
           /opt/mipsel-linux-muslsf-cross/bin/mipsel-linux-muslsf-gcc --version | head -1
           echo "/opt/mipsel-linux-muslsf-cross/bin" >> "$GITHUB_PATH"
