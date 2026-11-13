@@ -1,143 +1,179 @@
-name: Build Minimal Static Dropbear for EN751221
+# GitHub Actions: 静态编译 dropbear 最新版 -> MIPS (EcoNet EN751221 / MIPS 34Kc)
+# 目标环境: mipsel (小端) / MIPS32r2 / 无 FPU (soft-float) / Linux 3.18.21
+# 产物: dropbear + dbclient + dropbearkey + dropbearconvert + scp 全静态 musl 二进制
+#
+# 用法: 放到仓库 .github/workflows/dropbear-mipsel-static.yml
+#       Actions 页面 -> Run workflow (version 留空 = 自动抓最新 release)
+#
+# 已实测防坑点 (本地 musl.cc 工具链 + dropbear 2026.94 验证):
+#  1) 禁止给 CFLAGS 加 -mno-abicalls/-fno-pic: musl.cc 的 libc/libcrypt 是
+#     abicalls 构建的, 混用会导致 configure 的 crypt/zlib 检测全部失败
+#     (实测: 去掉后 crypt yes / deflate in -lz yes)
+#  2) zlib 交叉 configure 会误判出 -DNO_vsnprintf/-DNO_STRERROR 危险回退,
+#     musl 实际支持这两个函数, 必须 sed 去掉后再编译
+#  3) dropbear 的 AC_CHECK_LIB(z) 需要 LDFLAGS 里给 -L 指向 zlib 安装目录,
+#     不能只塞裸 libz.a 绝对路径
+#  4) 工具链: musl.cc 的 mipsel-linux-muslsf = 小端 + soft-float libc,
+#     与 34Kc (无 FPU) 严格匹配; 不要用 mipsel-linux-musl (hard-float)
+
+name: build-dropbear-mipsel-static
 
 on:
   workflow_dispatch:
     inputs:
-      dropbear_version:
-        description: 'Dropbear版本(留空=最新, 如 DROPBEAR_2026.94)'
+      version:
+        description: 'dropbear 版本号 (如 2026.94), 留空 = 自动取最新 release'
         required: false
         default: ''
+  # schedule:
+  #   - cron: '17 3 * * 1'   # 需要每周自动跟版时取消注释
 
-env:
-  BUILD_DIR: /tmp/db-build
-  INSTALL_DIR: /tmp/db-install
-  TOOLCHAIN_VER: mips-linux-musl-cross
-  ARTIFACT_NAME: dropbear-min-en751221
+permissions:
+  contents: read
+
+concurrency:
+  group: dropbear-mipsel
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Resolve dropbear version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            TAG=$(curl -fsSL --retry 3 \
+              https://api.github.com/repos/mkj/dropbear/releases/latest | jq -r .tag_name)
+            case "$TAG" in DROPBEAR_*) V="${TAG#DROPBEAR_}" ;; *) V="$TAG" ;; esac
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building dropbear $V (mipsel / mips32r2 / soft-float / musl static)"
 
-    - name: Cache Toolchain
-      id: cache-tc
-      uses: actions/cache@v4
-      with:
-        path: /opt/${{ env.TOOLCHAIN_VER }}
-        key: musl-${{ env.TOOLCHAIN_VER }}
+      - name: Install musl cross toolchain (mipsel soft-float)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /opt/tc.tgz wget https://github.com/musl-cc/musl.cc/releases/latest/download/mipsel-linux-muslsf-cross.tgz
+          tar xzf /opt/tc.tgz -C /opt && rm /opt/tc.tgz
+          /opt/mipsel-linux-muslsf-cross/bin/mipsel-linux-muslsf-gcc --version | head -1
+          echo "/opt/mipsel-linux-muslsf-cross/bin" >> "$GITHUB_PATH"
 
-    - name: Download Toolchain (musl soft-float, big-endian)
-      if: steps.cache-tc.outputs.cache-hit != 'true'
-      run: |
-        cd /opt
-        wget -q https://musl.cc/${TOOLCHAIN_VER}.tgz
-        tar -xzf ${TOOLCHAIN_VER}.tgz
-        rm -f ${TOOLCHAIN_VER}.tgz
+      - name: Download sources
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.version }}
+          curl -fsSL --retry 3 -o dropbear.tar.bz2 \
+            "https://matt.ucc.asn.au/dropbear/releases/dropbear-${V}.tar.bz2"
+          # 官方站异常时的备胎: git 归档 (源码树自带 configure, 无需 autoconf)
+          if ! tar tjf dropbear.tar.bz2 >/dev/null 2>&1; then
+            curl -fsSL --retry 3 -o dropbear.tar.gz \
+              "https://github.com/mkj/dropbear/archive/refs/tags/DROPBEAR_${V}.tar.gz"
+            tar xzf dropbear.tar.gz && mv dropbear-DROPBEAR_${V} dropbear-${V}
+            rm dropbear.tar.gz
+          else
+            tar xjf dropbear.tar.bz2 && rm dropbear.tar.bz2
+          fi
+          curl -fsSL --retry 3 -o zlib.tar.gz \
+            "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz"
+          tar xzf zlib.tar.gz && rm zlib.tar.gz
+          ls -d dropbear-* zlib-*
 
-    - name: Install Host Deps
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y wget xz-utils file
-        mkdir -p ${{ env.BUILD_DIR }} ${{ env.INSTALL_DIR }}
+      - name: Build static zlib (mipsel soft-float)
+        run: |
+          set -euo pipefail
+          cd zlib-1.3.1
+          CC=mipsel-linux-muslsf-gcc \
+          AR=mipsel-linux-muslsf-ar \
+          RANLIB=mipsel-linux-muslsf-ranlib \
+          CFLAGS='-Os -march=mips32r2' \
+            ./configure --static --prefix="$GITHUB_WORKSPACE/zlib-inst"
+          # 坑点 2: 去掉交叉探测误判引入的 NO_vsnprintf / NO_STRERROR
+          sed -i 's/ -DNO_STRERROR//; s/ -DNO_vsnprintf//g' Makefile
+          make -j"$(nproc)" libz.a
+          mkdir -p "$GITHUB_WORKSPACE/zlib-inst/lib" "$GITHUB_WORKSPACE/zlib-inst/include"
+          cp libz.a "$GITHUB_WORKSPACE/zlib-inst/lib/"
+          cp zlib.h zconf.h "$GITHUB_WORKSPACE/zlib-inst/include/"
 
-        # 验证工具链
-        export PATH=/opt/${TOOLCHAIN_VER}/bin:$PATH
-        ${TOOLCHAIN_VER%-cross}-gcc --version
-        # 输出应为 mips-linux-musl-gcc
+      - name: Build dropbear static
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.version }}
+          cd dropbear-${V}
+          ./configure --host=mipsel-linux-muslsf \
+              --enable-static \
+              --disable-harden \
+              CFLAGS="-static -Os -march=mips32r2 -I$GITHUB_WORKSPACE/zlib-inst/include" \
+              LDFLAGS="-static -L$GITHUB_WORKSPACE/zlib-inst/lib"
+          # 坑点 1/3 已规避: 不加 -mno-abicalls; zlib 用 -L 命中
+          # 如需栈保护, 可去掉 --disable-harden (GCC 内建 ssp, 不依赖 musl)
+          make -j"$(nproc)" PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp"
+          make strip PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp"
 
-    - name: Get Latest Version
-      id: ver
-      run: |
-        if [ -n "${{ github.event.inputs.dropbear_version }}" ]; then
-          V="${{ github.event.inputs.dropbear_version }}"
-        else
-          V=$(curl -sL https://api.github.com/repos/mkj/dropbear/releases/latest \
-              | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        fi
-        echo "version=$V" >> $GITHUB_OUTPUT
-        echo "📦 Dropbear: $V"
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.version }}
+          cd dropbear-${V}
+          FAIL=0
+          for b in dropbear dbclient dropbearkey dropbearconvert scp; do
+            echo "== $b"
+            file "$b"
+            # 必须: MIPS 小端 / 全静态 (无 NEEDED 动态依赖)
+            readelf -h "$b" | grep -q 'MIPS' || { echo "::error::$b 非 MIPS"; FAIL=1; }
+            readelf -h "$b" | grep -q 'LSB'   || { echo "::error::$b 非小端"; FAIL=1; }
+            if readelf -d "$b" 2>/dev/null | grep -q NEEDED; then
+              echo "::error::$b 存在动态依赖, 不是全静态"; FAIL=1
+            fi
+            # 必须: soft-float ABI (目标无 FPU)
+            readelf -A "$b" | grep 'FP ABI' | grep -qi 'hard float' && {
+              echo "::error::$b 是 hard-float, 目标机无法运行"; FAIL=1; }
+          done
+          [ "$FAIL" -eq 0 ] || exit 1
+          # qemu 用户态实跑: 验证指令集与 musl syscall 兼容 (模拟 24Kc, 覆盖 MIPS32r2)
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static >/dev/null
+          qemu-mipsel-static ./dropbear -V
+          qemu-mipsel-static ./dropbearkey -t ed25519 -f /tmp/testkey >/dev/null \
+            && echo "qemu-mipsel: dropbearkey ed25519 keygen OK"
 
-    - name: Download Source
-      run: |
-        cd ${{ env.BUILD_DIR }}
-        wget -q https://github.com/mkj/dropbear/archive/refs/tags/${{ steps.ver.outputs.version }}.tar.gz
-        tar -xzf ${{ steps.ver.outputs.version }}.tar.gz
+      - name: Package
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.version }}
+          NAME="dropbear-${V}-mipsel-musl-static"
+          mkdir -p "dist/${NAME}"
+          cp dropbear-${V}/{dropbear,dbclient,dropbearkey,dropbearconvert,scp} "dist/${NAME}/"
+          printf '%s\n' \
+            '目标: EcoNet EN751221 (MIPS 34Kc, mipsel, MIPS32r2, soft-float) / Linux 3.18.21' \
+            '工具链: mipsel-linux-muslsf (musl, GCC 11.2) + zlib 1.3.1, 全静态' \
+            '' \
+            '设备端运行 (示例, 假定上传到 /tmp):' \
+            '  chmod +x /tmp/dropbear /tmp/dbclient /tmp/dropbearkey /tmp/scp' \
+            '  /tmp/dropbear -R -E -p 2222        # 前台调试;  /tmp/dropbear -R -p 2222 后台' \
+            '  # -R = 首连时自动生成主机密钥, 默认写 /etc/dropbear/, 不可写则用 -r /tmp/dropbear_ed25519' \
+            '  # 密码认证走设备 /etc/shadow; 免密则放公钥到 /root/.ssh/authorized_keys' \
+            '' \
+            '客户端: /tmp/dbclient root@host;  /tmp/scp local root@host:/path' \
+            '注意: 无 sftp-server, 文件传输用 scp (dropbear 自带) 或 dbclient' \
+            > "dist/${NAME}/README.txt"
+          tar czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > SHA256SUMS && cat SHA256SUMS)
 
-    - name: Configure (Minimal, soft-float, static)
-      run: |
-        export PATH=/opt/${TOOLCHAIN_VER}/bin:$PATH
-        cd ${{ env.BUILD_DIR }}/dropbear-${{ steps.ver.outputs.version }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-${{ steps.ver.outputs.version }}-mipsel-musl-static
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
 
-        export CC=mips-linux-musl-gcc
-        export AR=mips-linux-musl-ar
-        export RANLIB=mips-linux-musl-ranlib
-        export STRIP=mips-linux-musl-strip
-
-        # ⚠️ musl 工具链本身就是 soft-float, -msoft-float 与 libc ABI 一致
-        export CFLAGS="-march=mips32 -msoft-float \
-                       -Os -ffunction-sections -fdata-sections \
-                       -fno-unwind-tables -fno-asynchronous-unwind-tables \
-                       -fomit-frame-pointer \
-                       -DDROPBEAR_SMALL_CODE -DDEBUG_TRACE=0"
-
-        export LDFLAGS="-static -Wl,--gc-sections -Wl,-S -Wl,-O1"
-
-        ./configure \
-          --host=mips-linux-musl \
-          --prefix=${{ env.INSTALL_DIR }} \
-          --disable-zlib \
-          --disable-syslog \
-          --disable-lastlog \
-          --disable-utmp \
-          --disable-utmpx \
-          --disable-wtmp \
-          --disable-wtmpx \
-          --disable-loginfunc \
-          --disable-pututline \
-          --disable-pututxline \
-          --disable-shadow \
-          --disable-largefile \
-          --disable-harden \
-          --enable-bundled-libtom \
-          --enable-static
-
-        echo "✅ 配置成功"
-
-    - name: Build
-      run: |
-        export PATH=/opt/${TOOLCHAIN_VER}/bin:$PATH
-        cd ${{ env.BUILD_DIR }}/dropbear-${{ steps.ver.outputs.version }}
-
-        make -j$(nproc) PROGRAMS="dropbear dbclient dropbearkey scp"
-
-        # install-program 目标在部分版本叫 make install, 兼容处理
-        make install-program DESTDIR=${{ env.INSTALL_DIR }} 2>/dev/null \
-          || make install DESTDIR=${{ env.INSTALL_DIR }}
-
-    - name: Strip & Verify
-      run: |
-        export PATH=/opt/${TOOLCHAIN_VER}/bin:$PATH
-        BIN_DIR=${{ env.INSTALL_DIR }}
-
-        find $BIN_DIR -type f ! -name "*.md" ! -name "*SUMS*" \
-          -exec mips-linux-musl-strip --strip-all \
-          --remove-section=.comment --remove-section=.note {} \; \
-          2>/dev/null || true
-
-        echo "📉 体积:"
-        find $BIN_DIR -type f -name "dropbear" -o -name "dbclient" \
-          -o -name "dropbearkey" -o -name "scp" | xargs ls -lh
-
-        echo ""
-        echo "🔍 架构验证 (必须看到: MIPS + MSB + soft-float):"
-        file $BIN_DIR/sbin/dropbear 2>/dev/null || file $BIN_DIR/usr/sbin/dropbear 2>/dev/null || \
-          find $BIN_DIR -name dropbear -exec file {} \;
-
-        echo ""
-        echo "🔍 ELF Flags (应为 soft-float ABI):"
-        find $BIN_DIR -name dropbear -exec mips-linux-musl-readelf -h {} \; \
-          | grep -E "Flags|Data|Machine"
+      # 如需发布到 GitHub Releases, 取消注释并打 tag 触发:
+      # - name: Upload to release
+      #   uses: softprops/action-gh-release@v2
+      #   if: startsWith(github.ref, 'refs/tags/')
+      #   with:
+      #     files: dist/*
