@@ -1,22 +1,26 @@
-# GitHub Actions: 静态编译 dropbear 最新版 -> MIPS (EcoNet EN751221 / MIPS 34Kc)
-# 目标环境: mipsel (小端) / MIPS32r2 / 无 FPU (soft-float) / Linux 3.18.21
+# GitHub Actions: 静态编译 dropbear 最新版 -> MIPS 大端 (EcoNet EN751221 / MIPS 34Kc)
+# 目标环境: MIPS BE (大端) / MIPS32r2 / 无 FPU (soft-float) / Linux 3.18.21
 # 产物: dropbear + dbclient + dropbearkey + dropbearconvert + scp 全静态 musl 二进制
 #
-# 用法: 放到仓库 .github/workflows/dropbear-mipsel-static.yml
+# 用法: 放到仓库 .github/workflows/build.yml
 #       Actions 页面 -> Run workflow (version 留空 = 自动抓最新 release)
 #
-# 已实测防坑点 (本地 musl.cc 工具链 + dropbear 2026.94 验证):
-#  1) 禁止给 CFLAGS 加 -mno-abicalls/-fno-pic: musl.cc 的 libc/libcrypt 是
-#     abicalls 构建的, 混用会导致 configure 的 crypt/zlib 检测全部失败
+# 已实测防坑点 (musl.cc 工具链 + dropbear 2026.94 本地验证):
+#  1) 禁止给 CFLAGS 加 -mno-abicalls/-fno-pic/-fno-PIE: musl 库 (libc/libcrypt)
+#     是 abicalls 构建的, MIPS 上这些 flag 会使 .o 变 non-abicalls, 混链导致
+#     configure 的 crypt/zlib 检测失败或链接报错
 #     (实测: 去掉后 crypt yes / deflate in -lz yes)
-#  2) zlib 交叉 configure 会误判出 -DNO_vsnprintf/-DNO_STRERROR 危险回退,
-#     musl 实际支持这两个函数, 必须 sed 去掉后再编译
-#  3) dropbear 的 AC_CHECK_LIB(z) 需要 LDFLAGS 里给 -L 指向 zlib 安装目录,
-#     不能只塞裸 libz.a 绝对路径
-#  4) 工具链: musl.cc 的 mipsel-linux-muslsf = 小端 + soft-float libc,
-#     与 34Kc (无 FPU) 严格匹配; 不要用 mipsel-linux-musl (hard-float)
+#     只在 LDFLAGS 加 -no-pie 即可得到 ET_EXEC 纯静态 (实测: EXEC + statically linked)
+#  2) zlib 交叉 configure 会误判出 -DNO_vsnprintf/-DNO_STRERROR 危险回退;
+#     本版已改用 --disable-zlib 并删除 zlib 编译步骤 (dropbear 2024.85+ 压缩
+#     默认关闭, 光猫管理链路无需压缩, 省一步编译并减小体积)
+#  3) 最小化: localoptions.h 裁掉后量子 KEX/ECDSA/FIDO 等 (2026.94 默认开启
+#     SNTRUP761/MLKEM768/SK_KEYS), 保留 curve25519 + ed25519 + rsa + aes128-ctr
+#     + chacha20-poly1305, 兼容主流客户端; -ffunction-sections + --gc-sections
+#     静态链接瘦身
+#  4) 端序: EN751221 = 大端 (mips-linux-muslsf, 无 el 后缀), 不要用 mipsel-*
 
-name: build-dropbear-mipsel-static
+name: build-dropbear-mipsbe-static
 
 on:
   workflow_dispatch:
@@ -32,7 +36,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: dropbear-mipsel
+  group: dropbear-mipsbe
   cancel-in-progress: false
 
 jobs:
@@ -53,15 +57,18 @@ jobs:
             case "$TAG" in DROPBEAR_*) V="${TAG#DROPBEAR_}" ;; *) V="$TAG" ;; esac
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "Building dropbear $V (mipsel / mips32r2 / soft-float / musl static)"
+          echo "Building dropbear $V (MIPS BE / mips32r2 / soft-float / musl static)"
 
-      - name: Install musl cross toolchain (mipsel soft-float)
+      - name: Install musl cross toolchain (MIPS big-endian soft-float)
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o /opt/tc.tgz https://github.com/musl-cc/musl.cc/releases/latest/download/mipsel-linux-muslsf-cross.tgz
+          # musl-cc/musl.cc GitHub mirror 与 musl.cc 主站为同一构建 (字节数一致),
+          # runner 从 GitHub 下载更快更稳
+          curl -fsSL --retry 3 -o /opt/tc.tgz \
+            https://github.com/musl-cc/musl.cc/releases/latest/download/mips-linux-muslsf-cross.tgz
           tar xzf /opt/tc.tgz -C /opt && rm /opt/tc.tgz
-          /opt/mipsel-linux-muslsf-cross/bin/mipsel-linux-muslsf-gcc --version | head -1
-          echo "/opt/mipsel-linux-muslsf-cross/bin" >> "$GITHUB_PATH"
+          /opt/mips-linux-muslsf-cross/bin/mips-linux-muslsf-gcc --version | head -1
+          echo "/opt/mips-linux-muslsf-cross/bin" >> "$GITHUB_PATH"
 
       - name: Download sources
         run: |
@@ -78,47 +85,57 @@ jobs:
           else
             tar xjf dropbear.tar.bz2 && rm dropbear.tar.bz2
           fi
-          curl -fsSL --retry 3 -o zlib.tar.gz \
-            "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz"
-          tar xzf zlib.tar.gz && rm zlib.tar.gz
-          ls -d dropbear-* zlib-*
+          ls -d dropbear-*
 
-      - name: Build static zlib (mipsel soft-float)
+      - name: Write minimal localoptions.h
         run: |
           set -euo pipefail
-          cd zlib-1.3.1
-          CC=mipsel-linux-muslsf-gcc \
-          AR=mipsel-linux-muslsf-ar \
-          RANLIB=mipsel-linux-muslsf-ranlib \
-          CFLAGS='-Os -march=mips32r2' \
-            ./configure --static --prefix="$GITHUB_WORKSPACE/zlib-inst"
-          # 坑点 2: 去掉交叉探测误判引入的 NO_vsnprintf / NO_STRERROR
-          sed -i 's/ -DNO_STRERROR//; s/ -DNO_vsnprintf//g' Makefile
-          make -j"$(nproc)" libz.a
-          mkdir -p "$GITHUB_WORKSPACE/zlib-inst/lib" "$GITHUB_WORKSPACE/zlib-inst/include"
-          cp libz.a "$GITHUB_WORKSPACE/zlib-inst/lib/"
-          cp zlib.h zconf.h "$GITHUB_WORKSPACE/zlib-inst/include/"
+          V=${{ steps.ver.outputs.version }}
+          cat > dropbear-${V}/localoptions.h <<'EOF'
+          /* 最小化裁剪 - 光猫管理场景 (开关名已对照 2026.94 default_options.h) */
+          /* 对称加密: 留 AES128-CTR + chacha20-poly1305, 裁 AES256 */
+          #define DROPBEAR_AES256 0
+          /* KEX: 裁后量子 (SNTRUP761/MLKEM768 是 2026.x 默认开启的大头),
+             留 curve25519 + DH group14 sha256 兜底 */
+          #define DROPBEAR_SNTRUP761 0
+          #define DROPBEAR_MLKEM768 0
+          /* 主机密钥/认证: 留 ed25519 + rsa, 裁 ECDSA (与 ECDH 共享曲线代码,
+             两者同裁才省) */
+          #define DROPBEAR_ECDH 0
+          #define DROPBEAR_ECDSA 0
+          /* FIDO/U2F 硬件密钥: 光猫无用 */
+          #define DROPBEAR_SK_KEYS 0
+          /* agent 转发/dbclient 附属特性 */
+          #define DROPBEAR_SVR_AGENTFWD 0
+          #define DROPBEAR_CLI_AGENTFWD 0
+          #define DROPBEAR_CLI_NETCAT 0
+          #define DROPBEAR_CLI_PROXYCMD 0
+          /* 运行时算法指定 (-c/-m) 解析 */
+          #define DROPBEAR_USER_ALGO_LIST 0
+          EOF
+          echo "localoptions.h written"
 
       - name: Build dropbear static
         run: |
           set -euo pipefail
           V=${{ steps.ver.outputs.version }}
           cd dropbear-${V}
-          ./configure --host=mipsel-linux-muslsf \
+          ./configure --host=mips-linux-muslsf \
               --enable-static \
-              --disable-harden  --disable-zlib \
-              CFLAGS="-static -Os -march=mips32r2 -I$GITHUB_WORKSPACE/zlib-inst/include -msoft-float \
+              --disable-harden \
+              --disable-zlib \
+              CFLAGS="-static -Os -march=mips32r2 -msoft-float \
                   -ffunction-sections -fdata-sections \
                   -fno-unwind-tables -fno-asynchronous-unwind-tables \
                   -fomit-frame-pointer \
-                  -fno-PIE \
                   -DDROPBEAR_SMALL_CODE \
                   -DDEBUG_TRACE=0" \
-              LDFLAGS="-static -no-pie -L$GITHUB_WORKSPACE/zlib-inst/lib  -Wl,--gc-sections -Wl,-S -Wl,-O1"
-          # 坑点 1/3 已规避: 不加 -mno-abicalls; zlib 用 -L 命中
-          # 如需栈保护, 可去掉 --disable-harden (GCC 内建 ssp, 不依赖 musl)
+              LDFLAGS="-static -no-pie -Wl,--gc-sections -Wl,-S -Wl,-O1"
+          # 坑点 1: CFLAGS 勿加 -fno-PIE/-fno-pic/-mno-abicalls (abicalls 混链);
+          #         -static + -no-pie 在链接期产出 ET_EXEC 纯静态, 实测无冲突
           make -j"$(nproc)" PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp"
           make strip PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp"
+          ls -la dropbear dbclient dropbearkey dropbearconvert scp
 
       - name: Verify binaries
         run: |
@@ -129,33 +146,38 @@ jobs:
           for b in dropbear dbclient dropbearkey dropbearconvert scp; do
             echo "== $b"
             file "$b"
-            # 必须: MIPS 小端 / 全静态 (无 NEEDED 动态依赖)
-            #readelf -h "$b" | grep -q 'MIPS' || { echo "::error::$b 非 MIPS"; FAIL=1; }
-            #readelf -h "$b" | grep -q 'LSB'   || { echo "::error::$b 非小端"; FAIL=1; }
+            # 必须: MIPS 大端。file 输出 BE="MSB"; readelf -h Data 行="big endian"
+            # ("LSB/MSB" 字样只出现在 file 输出, readelf 里没有)
+            file "$b" | grep -q 'MSB' || { echo "::error::$b 非大端"; FAIL=1; }
+            readelf -h "$b" | grep -q 'big endian' || { echo "::error::$b 非大端(readelf)"; FAIL=1; }
+            # 必须: 全静态 (file 静态字样 + 无 NEEDED 动态依赖)
+            file "$b" | grep -qE 'statically linked|static-pie' \
+              || { echo "::error::$b 非静态链接"; FAIL=1; }
             if readelf -d "$b" 2>/dev/null | grep -q NEEDED; then
               echo "::error::$b 存在动态依赖, 不是全静态"; FAIL=1
             fi
-            # 必须: soft-float ABI (目标无 FPU)
+            # 必须: soft-float ABI (34Kc 无 FPU)
             readelf -A "$b" | grep 'FP ABI' | grep -qi 'hard float' && {
               echo "::error::$b 是 hard-float, 目标机无法运行"; FAIL=1; }
           done
           [ "$FAIL" -eq 0 ] || exit 1
-          # qemu 用户态实跑: 验证指令集与 musl syscall 兼容 (模拟 24Kc, 覆盖 MIPS32r2)
-          #sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static >/dev/null
-          #qemu-mipsel-static ./dropbear -V
-          #qemu-mipsel-static ./dropbearkey -t ed25519 -f /tmp/testkey >/dev/null \
-          #  && echo "qemu-mipsel: dropbearkey ed25519 keygen OK"
+          # qemu BE 用户态实跑: 验证大端指令集与 musl syscall (模拟 24Kc, 覆盖 MIPS32r2)
+          # sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static >/dev/null
+          # qemu-mips-static ./dropbear -V
+          # qemu-mips-static ./dropbearkey -t ed25519 -f /tmp/testkey >/dev/null \
+          #   && echo "qemu-mips (BE): dropbearkey ed25519 keygen OK"
 
       - name: Package
         run: |
           set -euo pipefail
           V=${{ steps.ver.outputs.version }}
-          NAME="dropbear-${V}-mipsel-musl-static"
+          NAME="dropbear-${V}-mipsbe-musl-static"
           mkdir -p "dist/${NAME}"
           cp dropbear-${V}/{dropbear,dbclient,dropbearkey,dropbearconvert,scp} "dist/${NAME}/"
           printf '%s\n' \
-            '目标: EcoNet EN751221 (MIPS 34Kc, mipsel, MIPS32r2, soft-float) / Linux 3.18.21' \
-            '工具链: mipsel-linux-muslsf (musl, GCC 11.2) + zlib 1.3.1, 全静态' \
+            "目标: EcoNet EN751221 (MIPS 34Kc, 大端 BE, MIPS32r2, soft-float) / Linux 3.18.21" \
+            "工具链: mips-linux-muslsf (musl, 大端), 全静态 ET_EXEC, 无动态依赖" \
+            "裁剪: 无 zlib / 无后量子 KEX / 无 ECDSA / 无 FIDO (localoptions.h)" \
             '' \
             '设备端运行 (示例, 假定上传到 /tmp):' \
             '  chmod +x /tmp/dropbear /tmp/dbclient /tmp/dropbearkey /tmp/scp' \
@@ -172,7 +194,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dropbear-${{ steps.ver.outputs.version }}-mipsel-musl-static
+          name: dropbear-${{ steps.ver.outputs.version }}-mipsbe-musl-static
           path: dist/*
           if-no-files-found: error
           retention-days: 30
